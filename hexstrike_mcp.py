@@ -27,6 +27,11 @@ import time
 from datetime import datetime
 
 from mcp.server.fastmcp import FastMCP
+try:
+    from anyio import BrokenResourceError
+except ImportError:
+    # Fallback if anyio is not available
+    BrokenResourceError = Exception
 
 class HexStrikeColors:
     """Enhanced color palette matching the server's ModernVisualEngine.COLORS"""
@@ -141,7 +146,7 @@ logger = logging.getLogger(__name__)
 
 # Default configuration
 DEFAULT_HEXSTRIKE_SERVER = "http://127.0.0.1:8888"  # Default HexStrike server URL
-DEFAULT_REQUEST_TIMEOUT = 300  # 5 minutes default timeout for API requests
+DEFAULT_REQUEST_TIMEOUT = 600  # 10 minutes default timeout for API requests (increased for long-running scans)
 MAX_RETRIES = 3  # Maximum number of retries for connection attempts
 
 class HexStrikeClient:
@@ -210,6 +215,14 @@ class HexStrikeClient:
             response = self.session.get(url, params=params, timeout=self.timeout)
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.Timeout as e:
+            logger.error(f"🚫 Request timed out after {self.timeout}s: {str(e)}")
+            return {
+                "error": f"Request timed out after {self.timeout}s: {str(e)}",
+                "success": False,
+                "timeout": True,
+                "timeout_seconds": self.timeout
+            }
         except requests.exceptions.RequestException as e:
             logger.error(f"🚫 Request failed: {str(e)}")
             return {"error": f"Request failed: {str(e)}", "success": False}
@@ -235,6 +248,14 @@ class HexStrikeClient:
             response = self.session.post(url, json=json_data, timeout=self.timeout)
             response.raise_for_status()
             return response.json()
+        except requests.exceptions.Timeout as e:
+            logger.error(f"🚫 Request timed out after {self.timeout}s: {str(e)}")
+            return {
+                "error": f"Request timed out after {self.timeout}s: {str(e)}",
+                "success": False,
+                "timeout": True,
+                "timeout_seconds": self.timeout
+            }
         except requests.exceptions.RequestException as e:
             logger.error(f"🚫 Request failed: {str(e)}")
             return {"error": f"Request failed: {str(e)}", "success": False}
@@ -4733,36 +4754,57 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
             "objective": objective,
             "max_tools": max_tools
         }
-        result = hexstrike_client.safe_post("api/intelligence/smart-scan", data)
+        try:
+            result = hexstrike_client.safe_post("api/intelligence/smart-scan", data)
 
-        if result.get("success"):
-            scan_results = result.get("scan_results", {})
-            tools_executed = scan_results.get("tools_executed", [])
-            execution_summary = scan_results.get("execution_summary", {})
+            # Check if it's a timeout error
+            if result.get("timeout"):
+                logger.warning(f"{HexStrikeColors.CYBER_ORANGE}⏰ Scan timed out after {result.get('timeout_seconds', 600)}s{HexStrikeColors.RESET}")
+                return {
+                    "success": False,
+                    "target": target,
+                    "error": f"Scan timed out after {result.get('timeout_seconds', 600)}s. The scan may take longer than expected. Please try again with a smaller scope or increase the timeout.",
+                    "timeout": True,
+                    "timeout_seconds": result.get('timeout_seconds', 600),
+                    "timestamp": datetime.now().isoformat()
+                }
 
-            # Enhanced logging with detailed results
-            logger.info(f"{HexStrikeColors.SUCCESS}✅ Intelligent scan completed for {target}{HexStrikeColors.RESET}")
-            logger.info(f"{HexStrikeColors.CYBER_ORANGE}📊 Execution Summary:{HexStrikeColors.RESET}")
-            logger.info(f"   • Tools executed: {execution_summary.get('successful_tools', 0)}/{execution_summary.get('total_tools', 0)}")
-            logger.info(f"   • Success rate: {execution_summary.get('success_rate', 0):.1f}%")
-            logger.info(f"   • Total vulnerabilities: {scan_results.get('total_vulnerabilities', 0)}")
-            logger.info(f"   • Execution time: {execution_summary.get('total_execution_time', 0):.2f}s")
+            if result.get("success"):
+                scan_results = result.get("scan_results", {})
+                tools_executed = scan_results.get("tools_executed", [])
+                execution_summary = scan_results.get("execution_summary", {})
 
-            # Log successful tools
-            successful_tools = [t['tool'] for t in tools_executed if t.get('success')]
-            if successful_tools:
-                logger.info(f"{HexStrikeColors.HIGHLIGHT_GREEN} Successful tools: {', '.join(successful_tools)} {HexStrikeColors.RESET}")
+                # Enhanced logging with detailed results
+                logger.info(f"{HexStrikeColors.SUCCESS}✅ Intelligent scan completed for {target}{HexStrikeColors.RESET}")
+                logger.info(f"{HexStrikeColors.CYBER_ORANGE}📊 Execution Summary:{HexStrikeColors.RESET}")
+                logger.info(f"   • Tools executed: {execution_summary.get('successful_tools', 0)}/{execution_summary.get('total_tools', 0)}")
+                logger.info(f"   • Success rate: {execution_summary.get('success_rate', 0):.1f}%")
+                logger.info(f"   • Total vulnerabilities: {scan_results.get('total_vulnerabilities', 0)}")
+                logger.info(f"   • Execution time: {execution_summary.get('total_execution_time', 0):.2f}s")
 
-            # Log failed tools
-            failed_tools = [t['tool'] for t in tools_executed if not t.get('success')]
-            if failed_tools:
-                logger.warning(f"{HexStrikeColors.HIGHLIGHT_RED} Failed tools: {', '.join(failed_tools)} {HexStrikeColors.RESET}")
+                # Log successful tools
+                successful_tools = [t['tool'] for t in tools_executed if t.get('success')]
+                if successful_tools:
+                    logger.info(f"{HexStrikeColors.HIGHLIGHT_GREEN} Successful tools: {', '.join(successful_tools)} {HexStrikeColors.RESET}")
 
-            # Log vulnerabilities found
-            if scan_results.get('total_vulnerabilities', 0) > 0:
-                logger.warning(f"{HexStrikeColors.VULN_HIGH}🚨 {scan_results['total_vulnerabilities']} vulnerabilities detected!{HexStrikeColors.RESET}")
-        else:
-            logger.error(f"{HexStrikeColors.ERROR}❌ Intelligent scan failed for {target}: {result.get('error', 'Unknown error')}{HexStrikeColors.RESET}")
+                # Log failed tools
+                failed_tools = [t['tool'] for t in tools_executed if not t.get('success')]
+                if failed_tools:
+                    logger.warning(f"{HexStrikeColors.HIGHLIGHT_RED} Failed tools: {', '.join(failed_tools)} {HexStrikeColors.RESET}")
+
+                # Log vulnerabilities found
+                if scan_results.get('total_vulnerabilities', 0) > 0:
+                    logger.warning(f"{HexStrikeColors.VULN_HIGH}🚨 {scan_results['total_vulnerabilities']} vulnerabilities detected!{HexStrikeColors.RESET}")
+            else:
+                logger.error(f"{HexStrikeColors.ERROR}❌ Intelligent scan failed for {target}: {result.get('error', 'Unknown error')}{HexStrikeColors.RESET}")
+        except Exception as e:
+            logger.error(f"{HexStrikeColors.ERROR}💥 Unexpected error in intelligent scan: {str(e)}{HexStrikeColors.RESET}")
+            return {
+                "success": False,
+                "target": target,
+                "error": f"Unexpected error: {str(e)}",
+                "timestamp": datetime.now().isoformat()
+            }
 
         return result
 
@@ -4861,47 +4903,91 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         """
         logger.info(f"🔬 Starting AI vulnerability assessment for {target}")
 
-        # Analyze target first
-        analysis_result = hexstrike_client.safe_post("api/intelligence/analyze-target", {"target": target})
+        try:
+            # Analyze target first
+            analysis_result = hexstrike_client.safe_post("api/intelligence/analyze-target", {"target": target})
 
-        if not analysis_result.get("success"):
-            return analysis_result
+            if not analysis_result.get("success"):
+                # Check if it's a timeout error
+                if analysis_result.get("timeout"):
+                    logger.warning(f"⏰ Target analysis timed out after {analysis_result.get('timeout_seconds', 300)}s")
+                    return {
+                        "success": False,
+                        "target": target,
+                        "error": f"Target analysis timed out after {analysis_result.get('timeout_seconds', 300)}s. The assessment may take longer than expected. Please try again with a smaller scope or increase the timeout.",
+                        "timeout": True,
+                        "partial_results": {
+                            "target": target,
+                            "focus_areas": focus_areas
+                        },
+                        "timestamp": datetime.now().isoformat()
+                    }
+                return analysis_result
 
-        profile = analysis_result.get("target_profile", {})
-        target_type = profile.get("target_type", "unknown")
+            profile = analysis_result.get("target_profile", {})
+            target_type = profile.get("target_type", "unknown")
 
-        # Select tools based on focus areas and target type
-        if focus_areas == "all":
-            objective = "comprehensive"
-        elif "web" in focus_areas and target_type == "web_application":
-            objective = "comprehensive"
-        elif "network" in focus_areas and target_type == "network_host":
-            objective = "comprehensive"
-        else:
-            objective = "quick"
+            # Select tools based on focus areas and target type
+            if focus_areas == "all":
+                objective = "comprehensive"
+            elif "web" in focus_areas and target_type == "web_application":
+                objective = "comprehensive"
+            elif "network" in focus_areas and target_type == "network_host":
+                objective = "comprehensive"
+            else:
+                objective = "quick"
 
-        # Execute vulnerability assessment
-        scan_result = hexstrike_client.safe_post("api/intelligence/smart-scan", {
-            "target": target,
-            "objective": objective,
-            "max_tools": 6
-        })
+            # Execute vulnerability assessment
+            scan_result = hexstrike_client.safe_post("api/intelligence/smart-scan", {
+                "target": target,
+                "objective": objective,
+                "max_tools": 6
+            })
 
-        logger.info(f"✅ AI vulnerability assessment completed for {target}")
+            # Check if scan timed out
+            if not scan_result.get("success") and scan_result.get("timeout"):
+                logger.warning(f"⏰ Vulnerability scan timed out after {scan_result.get('timeout_seconds', 300)}s")
+                return {
+                    "success": False,
+                    "target": target,
+                    "error": f"Vulnerability scan timed out after {scan_result.get('timeout_seconds', 300)}s. The scan may take longer than expected. Please try again with a smaller scope or increase the timeout.",
+                    "timeout": True,
+                    "partial_results": {
+                        "target": target,
+                        "focus_areas": focus_areas,
+                        "target_analysis": profile,
+                        "risk_assessment": {
+                            "risk_level": profile.get("risk_level", "unknown"),
+                            "attack_surface_score": profile.get("attack_surface_score", 0),
+                            "confidence_score": profile.get("confidence_score", 0)
+                        }
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
 
-        return {
-            "success": True,
-            "target": target,
-            "focus_areas": focus_areas,
-            "target_analysis": profile,
-            "vulnerability_scan": scan_result.get("scan_results", {}),
-            "risk_assessment": {
-                "risk_level": profile.get("risk_level", "unknown"),
-                "attack_surface_score": profile.get("attack_surface_score", 0),
-                "confidence_score": profile.get("confidence_score", 0)
-            },
-            "timestamp": datetime.now().isoformat()
-        }
+            logger.info(f"✅ AI vulnerability assessment completed for {target}")
+
+            return {
+                "success": True,
+                "target": target,
+                "focus_areas": focus_areas,
+                "target_analysis": profile,
+                "vulnerability_scan": scan_result.get("scan_results", {}),
+                "risk_assessment": {
+                    "risk_level": profile.get("risk_level", "unknown"),
+                    "attack_surface_score": profile.get("attack_surface_score", 0),
+                    "confidence_score": profile.get("confidence_score", 0)
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+        except Exception as e:
+            logger.error(f"💥 Unexpected error in vulnerability assessment: {str(e)}")
+            return {
+                "success": False,
+                "target": target,
+                "error": f"Unexpected error: {str(e)}",
+                "timestamp": datetime.now().isoformat()
+            }
 
     # ============================================================================
     # BUG BOUNTY HUNTING SPECIALIZED WORKFLOWS
@@ -5460,11 +5546,26 @@ def main():
         logger.info("🚀 Starting HexStrike AI MCP server")
         logger.info("🤖 Ready to serve AI agents with enhanced cybersecurity capabilities")
         mcp.run()
+    except KeyboardInterrupt:
+        logger.info("🛑 MCP server stopped by user")
+        sys.exit(0)
+    except BrokenResourceError as e:
+        # This can happen when the client closes the connection during long-running operations
+        logger.warning(f"⚠️  Client connection closed: {str(e)}")
+        logger.info("💡 This is normal when long-running scans complete and the client disconnects")
+        sys.exit(0)
     except Exception as e:
-        logger.error(f"💥 Error starting MCP server: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        sys.exit(1)
+        error_msg = str(e)
+        # Check if it's a BrokenResourceError (may be wrapped in ExceptionGroup)
+        if "BrokenResourceError" in error_msg or "unhandled errors in a TaskGroup" in error_msg:
+            logger.warning(f"⚠️  Client connection closed during operation: {error_msg}")
+            logger.info("💡 This is normal when long-running scans complete and the client disconnects")
+            sys.exit(0)
+        else:
+            logger.error(f"💥 Error starting MCP server: {error_msg}")
+            import traceback
+            logger.error(traceback.format_exc())
+            sys.exit(1)
 
 if __name__ == "__main__":
     main()
